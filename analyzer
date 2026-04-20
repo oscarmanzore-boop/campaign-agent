@@ -1,0 +1,446 @@
+"""
+AI Ad Analyzer
+==============
+Reads metrics.db from the data collector, scores every ad using Claude,
+identifies winners/losers, extracts creative patterns, and produces
+a full JSON report ready for the dashboard.
+
+Tuned for: Lead generation business, 3x ROAS target.
+"""
+
+import os
+import json
+import sqlite3
+import logging
+import requests
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+
+load_dotenv()
+
+log = logging.getLogger("analyzer")
+
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+DB_PATH           = os.getenv("DB_PATH", "data_collector/metrics.db")
+REPORT_PATH       = os.getenv("REPORT_PATH", "analyzer/report.json")
+
+# ── Business thresholds (lead gen, 3x target) ─────────────────────────────────
+THRESHOLDS = {
+    "roas_winner":       3.0,   # above this = winner
+    "roas_loser":        1.0,   # below this = loser
+    "ctr_good":          1.5,   # % — good click-through
+    "ctr_poor":          0.5,   # % — poor click-through
+    "cpm_high":          6.0,   # $ — expensive, audience issue
+    "min_spend":         15.0,  # $ — minimum before judging
+    "min_impressions":   500,   # below this = needs more data
+    "frequency_fatigue": 4.0,   # above this = ad fatigue
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Database queries
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_ads(db_path: str = DB_PATH, days: int = 7) -> list[dict]:
+    """Load all ads from the last N days."""
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"Database not found: {db_path}. Run the collector first.")
+
+    since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    conn  = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+
+    rows = conn.execute("""
+        SELECT
+            ad_id, ad_name, adset_name, campaign_name,
+            spend, impressions, reach, frequency,
+            clicks, ctr, cpm, cpc,
+            conversions, conversion_value, roas,
+            video_plays, video_p25, video_p50, video_p75, video_p100,
+            date_start, date_stop
+        FROM ad_metrics
+        WHERE date_start >= ?
+        ORDER BY spend DESC
+    """, (since,)).fetchall()
+
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def load_summary(db_path: str = DB_PATH, days: int = 7) -> dict:
+    """Load account-level aggregate summary."""
+    since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    conn  = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+
+    row = conn.execute("""
+        SELECT
+            COUNT(DISTINCT ad_id)                                        AS total_ads,
+            ROUND(SUM(spend), 2)                                         AS total_spend,
+            SUM(impressions)                                             AS total_impressions,
+            SUM(clicks)                                                  AS total_clicks,
+            SUM(conversions)                                             AS total_leads,
+            ROUND(SUM(conversion_value), 2)                              AS total_revenue,
+            ROUND(AVG(ctr), 4)                                           AS avg_ctr,
+            ROUND(AVG(cpm), 2)                                           AS avg_cpm,
+            ROUND(AVG(frequency), 2)                                     AS avg_frequency,
+            ROUND(SUM(conversion_value) / NULLIF(SUM(spend), 0), 2)     AS overall_roas,
+            ROUND(SUM(spend) / NULLIF(SUM(conversions), 0), 2)          AS cost_per_lead
+        FROM ad_metrics
+        WHERE date_start >= ?
+    """, (since,)).fetchone()
+
+    conn.close()
+    return dict(row) if row else {}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Rule-based pre-scoring (fast, no API call)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def rule_score(ad: dict) -> tuple[str, list[str]]:
+    """
+    Classify ad as 'winner', 'loser', or 'watching' using hard thresholds.
+    Returns (status, list_of_flags).
+    """
+    flags  = []
+    spend  = ad.get("spend", 0) or 0
+    roas   = ad.get("roas", 0) or 0
+    ctr    = ad.get("ctr", 0) or 0
+    cpm    = ad.get("cpm", 0) or 0
+    imps   = ad.get("impressions", 0) or 0
+    freq   = ad.get("frequency", 0) or 0
+    conv   = ad.get("conversions", 0) or 0
+    t      = THRESHOLDS
+
+    if imps < t["min_impressions"] or spend < t["min_spend"]:
+        return "watching", ["Needs more data — under impression/spend threshold"]
+
+    if freq > t["frequency_fatigue"]:
+        flags.append(f"Ad fatigue — frequency {freq:.1f}x (above {t['frequency_fatigue']}x)")
+
+    if cpm > t["cpm_high"]:
+        flags.append(f"High CPM ${cpm:.2f} — possible audience mismatch")
+
+    if ctr < t["ctr_poor"]:
+        flags.append(f"Low CTR {ctr:.2f}% — creative not grabbing attention")
+    elif ctr >= t["ctr_good"]:
+        flags.append(f"Strong CTR {ctr:.2f}%")
+
+    if conv == 0 and spend > t["min_spend"] * 2:
+        flags.append("Zero conversions after significant spend — pause candidate")
+
+    if roas >= t["roas_winner"]:
+        return "winner", flags
+    elif roas <= t["roas_loser"] and spend >= t["min_spend"]:
+        return "loser", flags
+    else:
+        return "watching", flags
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Claude AI scoring
+# ══════════════════════════════════════════════════════════════════════════════
+
+def score_ad_with_claude(ad: dict, status: str, flags: list[str], avg_cpm: float, avg_ctr: float) -> dict:
+    """
+    Send a single ad to Claude for deep analysis.
+    Returns score (0-100), verdict, fixes, and pattern tags.
+    """
+    if not ANTHROPIC_API_KEY:
+        return _fallback_score(ad, status, flags)
+
+    prompt = f"""You are an expert Meta Ads analyst for a lead generation business with a 3x ROAS target.
+
+Analyze this ad and return a JSON object only — no other text.
+
+AD METRICS:
+- Name: {ad.get('ad_name', 'Unknown')}
+- Campaign: {ad.get('campaign_name', '')} / Ad Set: {ad.get('adset_name', '')}
+- Spend: ${ad.get('spend', 0):.2f}
+- ROAS: {ad.get('roas', 0):.2f}x (target: 3x)
+- CTR: {ad.get('ctr', 0):.2f}% (account avg: {avg_ctr:.2f}%)
+- CPM: ${ad.get('cpm', 0):.2f} (account avg: ${avg_cpm:.2f})
+- CPC: ${ad.get('cpc', 0):.2f}
+- Leads/Conversions: {ad.get('conversions', 0)}
+- Cost per lead: ${(ad.get('spend',0)/ad.get('conversions',1)) if ad.get('conversions',0) > 0 else 0:.2f}
+- Impressions: {ad.get('impressions', 0):,}
+- Frequency: {ad.get('frequency', 0):.1f}x
+- Video retention 25%: {ad.get('video_p25', 0) or 'N/A'}
+- Video retention 50%: {ad.get('video_p50', 0) or 'N/A'}
+- Pre-classification: {status}
+- Flags: {', '.join(flags) if flags else 'none'}
+
+Return ONLY this JSON structure:
+{{
+  "score": <integer 0-100>,
+  "verdict": "<2-3 sentence plain English explanation of why this ad is performing well or poorly, specific to lead gen>",
+  "fixes": ["<specific actionable fix 1>", "<fix 2>", "<fix 3 if needed>"],
+  "whats_working": "<one sentence on what to keep if performing well, or empty string if not>",
+  "hook_type": "<one of: problem-solution, testimonial, discount-offer, lifestyle, direct-response, curiosity, unknown>",
+  "priority_action": "<one of: scale-budget, pause-immediately, test-new-hook, fix-cta, reduce-frequency, needs-more-data>"
+}}
+
+Scoring guide for lead gen:
+- 80-100: Profitable, above 3x ROAS, strong CTR, scale immediately
+- 60-79: Good potential, near target, minor fixes needed
+- 40-59: Underperforming, clear issues, needs significant changes
+- 20-39: Poor performance, strong pause candidate
+- 0-19: Immediate pause, wasting budget"""
+
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 600,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        text = r.json()["content"][0]["text"].strip()
+        # Strip markdown fences if present
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        return json.loads(text.strip())
+    except Exception as e:
+        log.warning("Claude scoring failed for %s: %s", ad.get("ad_name"), e)
+        return _fallback_score(ad, status, flags)
+
+
+def _fallback_score(ad: dict, status: str, flags: list[str]) -> dict:
+    """Rule-based score when Claude API is unavailable."""
+    roas  = ad.get("roas", 0) or 0
+    ctr   = ad.get("ctr", 0) or 0
+    spend = ad.get("spend", 0) or 0
+    imps  = ad.get("impressions", 0) or 0
+
+    if imps < THRESHOLDS["min_impressions"]:
+        score = 50
+    else:
+        score = min(100, max(0, int(
+            (roas / 3.0) * 50 +
+            (ctr / 1.5) * 30 +
+            (20 if spend > THRESHOLDS["min_spend"] else 0)
+        )))
+
+    fixes = [f for f in flags if "fatigue" in f.lower() or "low" in f.lower() or "zero" in f.lower() or "high" in f.lower()]
+
+    return {
+        "score": score,
+        "verdict": f"ROAS {roas:.1f}x vs 3x target. CTR {ctr:.2f}%. " + (
+            "Strong performer — continue scaling." if status == "winner" else
+            "Underperforming — review targeting and creative." if status == "loser" else
+            "Needs more data before making decisions."
+        ),
+        "fixes": fixes or ["Review creative and targeting"],
+        "whats_working": "Strong ROAS above target." if status == "winner" else "",
+        "hook_type": "unknown",
+        "priority_action": (
+            "scale-budget" if status == "winner" else
+            "pause-immediately" if status == "loser" else
+            "needs-more-data"
+        ),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Pattern extraction
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extract_patterns(scored_ads: list[dict]) -> dict:
+    """
+    Find what creative patterns separate winners from losers.
+    Returns a patterns dict for the report.
+    """
+    winners = [a for a in scored_ads if a["status"] == "winner"]
+    losers  = [a for a in scored_ads if a["status"] == "loser"]
+
+    def avg(ads, key):
+        vals = [a.get(key, 0) or 0 for a in ads if (a.get(key) or 0) > 0]
+        return round(sum(vals) / len(vals), 2) if vals else 0
+
+    winner_hooks = {}
+    for a in winners:
+        h = a.get("ai", {}).get("hook_type", "unknown")
+        winner_hooks[h] = winner_hooks.get(h, 0) + 1
+
+    loser_hooks = {}
+    for a in losers:
+        h = a.get("ai", {}).get("hook_type", "unknown")
+        loser_hooks[h] = loser_hooks.get(h, 0) + 1
+
+    return {
+        "winner_avg_roas":  avg(winners, "roas"),
+        "winner_avg_ctr":   avg(winners, "ctr"),
+        "winner_avg_cpm":   avg(winners, "cpm"),
+        "loser_avg_roas":   avg(losers, "roas"),
+        "loser_avg_ctr":    avg(losers, "ctr"),
+        "loser_avg_cpm":    avg(losers, "cpm"),
+        "top_winner_hooks": sorted(winner_hooks.items(), key=lambda x: x[1], reverse=True),
+        "top_loser_hooks":  sorted(loser_hooks.items(), key=lambda x: x[1], reverse=True),
+        "total_winners":    len(winners),
+        "total_losers":     len(losers),
+        "total_watching":   len([a for a in scored_ads if a["status"] == "watching"]),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Main analyzer
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_analysis(days: int = 7, db_path: str = DB_PATH, report_path: str = REPORT_PATH) -> dict:
+    """
+    Full analysis pipeline:
+    1. Load ads from DB
+    2. Rule-based pre-classification
+    3. Claude AI deep scoring per ad
+    4. Pattern extraction
+    5. Save JSON report
+    """
+    log.info("=" * 60)
+    log.info("AI Analysis run — %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    log.info("=" * 60)
+
+    # Load data
+    ads     = load_ads(db_path=db_path, days=days)
+    summary = load_summary(db_path=db_path, days=days)
+
+    if not ads:
+        log.warning("No ad data found. Run the collector first.")
+        return {}
+
+    log.info("Loaded %d ads from DB", len(ads))
+    avg_cpm = summary.get("avg_cpm", 4.0) or 4.0
+    avg_ctr = summary.get("avg_ctr", 0.015) or 0.015
+
+    # Score each ad
+    scored = []
+    for i, ad in enumerate(ads):
+        log.info("Scoring ad %d/%d: %s", i+1, len(ads), ad.get("ad_name",""))
+        status, flags = rule_score(ad)
+        ai_result     = score_ad_with_claude(ad, status, flags, avg_cpm, avg_ctr)
+        scored.append({
+            **ad,
+            "status": status,
+            "flags":  flags,
+            "ai":     ai_result,
+            "score":  ai_result.get("score", 50),
+        })
+
+    # Sort by score descending
+    scored.sort(key=lambda x: x["score"], reverse=True)
+
+    # Extract patterns
+    patterns = extract_patterns(scored)
+
+    # Build report
+    report = {
+        "generated_at":  datetime.now().isoformat(),
+        "period_days":   days,
+        "summary":       summary,
+        "patterns":      patterns,
+        "ads":           scored,
+        "top_winners":   [a for a in scored if a["status"] == "winner"][:5],
+        "top_losers":    sorted([a for a in scored if a["status"] == "loser"],
+                                key=lambda x: x["spend"], reverse=True)[:5],
+        "quick_wins": [
+            a["ai"].get("fixes", [])[0]
+            for a in scored
+            if a["status"] == "loser" and a["ai"].get("fixes")
+        ][:5],
+    }
+
+    # Save report
+    os.makedirs(os.path.dirname(report_path) if os.path.dirname(report_path) else ".", exist_ok=True)
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=2)
+
+    log.info("Report saved to %s", report_path)
+    log.info("Winners: %d | Losers: %d | Watching: %d",
+             patterns["total_winners"], patterns["total_losers"], patterns["total_watching"])
+
+    if report["top_winners"]:
+        top = report["top_winners"][0]
+        log.info("Top winner: %s — score %d, ROAS %.1fx",
+                 top.get("ad_name"), top.get("score"), top.get("roas", 0))
+
+    if report["top_losers"]:
+        worst = report["top_losers"][0]
+        log.info("Worst loser: %s — score %d, $%.2f wasted",
+                 worst.get("ad_name"), worst.get("score"), worst.get("spend", 0))
+
+    return report
+
+
+if __name__ == "__main__":
+    import argparse
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[logging.StreamHandler(), logging.FileHandler("analyzer.log")],
+    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--days", type=int, default=7)
+    parser.add_argument("--db",   default=DB_PATH)
+    parser.add_argument("--out",  default=REPORT_PATH)
+    args = parser.parse_args()
+    run_analysis(days=args.days, db_path=args.db, report_path=args.out)
+
+name: Daily ad analysis
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  collect-and-analyze:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run collector
+        run: python run_collector.py --no-creative
+        env:
+          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+          META_AD_ACCOUNT_ID: ${{ secrets.META_AD_ACCOUNT_ID }}
+          META_CAMPAIGN_ID: ${{ secrets.META_CAMPAIGN_ID }}
+          META_ADSET_ID: ${{ secrets.META_ADSET_ID }}
+          META_PAGE_ID: ${{ secrets.META_PAGE_ID }}
+
+      - name: Run AI analyzer
+        run: python analyzer/analyzer.py --days 7
+        env:
+          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+          META_AD_ACCOUNT_ID: ${{ secrets.META_AD_ACCOUNT_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Save artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: campaign-report
+          path: |
+            data_collector/metrics.db
+            analyzer/report.json
+          retention-days: 7
+
