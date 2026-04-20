@@ -1,0 +1,495 @@
+"""
+Meta Ads Data Collector
+=======================
+Pulls ad-level performance metrics from the Meta Marketing Insights API.
+
+Metrics collected per ad:
+  - CTR (click-through rate)
+  - ROAS (return on ad spend)
+  - CPM (cost per 1,000 impressions)
+  - CPC (cost per click)
+  - Spend
+  - Impressions / Reach / Frequency
+  - Conversions + conversion value
+  - Video views (if video ad)
+  - Ad name, status, creative type, campaign/adset context
+
+Usage:
+    from data_collector.collector import MetaCollector
+    collector = MetaCollector()
+    df = collector.collect_all()        # all active ads, last 7 days
+    df = collector.collect_all(days=30) # last 30 days
+"""
+
+import os
+import time
+import logging
+import requests
+import sqlite3
+import json
+from datetime import datetime, timedelta
+from typing import Optional
+from dotenv import load_dotenv
+
+load_dotenv()
+
+log = logging.getLogger("collector")
+
+# ── Config ────────────────────────────────────────────────────────────────────
+META_TOKEN      = os.getenv("META_ACCESS_TOKEN")
+AD_ACCOUNT      = os.getenv("META_AD_ACCOUNT_ID")   # act_XXXXXXX
+API_VERSION     = "v21.0"
+BASE            = f"https://graph.facebook.com/{API_VERSION}"
+DB_PATH         = os.getenv("DB_PATH", "data_collector/metrics.db")
+
+# Insight fields to pull for every ad
+INSIGHT_FIELDS = [
+    "ad_id",
+    "ad_name",
+    "adset_id",
+    "adset_name",
+    "campaign_id",
+    "campaign_name",
+    "spend",
+    "impressions",
+    "reach",
+    "frequency",
+    "clicks",
+    "ctr",
+    "cpm",
+    "cpc",
+    "cpp",                         # cost per result
+    "actions",                     # conversions breakdown
+    "action_values",               # conversion revenue breakdown
+    "video_p25_watched_actions",   # 25% video views
+    "video_p50_watched_actions",
+    "video_p75_watched_actions",
+    "video_p100_watched_actions",
+    "video_play_actions",
+    "objective",
+    "buying_type",
+]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Database
+# ══════════════════════════════════════════════════════════════════════════════
+
+def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
+    """Create tables if they don't exist."""
+    os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else ".", exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ad_metrics (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            collected_at        TEXT NOT NULL,
+            date_start          TEXT NOT NULL,
+            date_stop           TEXT NOT NULL,
+            ad_id               TEXT NOT NULL,
+            ad_name             TEXT,
+            adset_id            TEXT,
+            adset_name          TEXT,
+            campaign_id         TEXT,
+            campaign_name       TEXT,
+            spend               REAL,
+            impressions         INTEGER,
+            reach               INTEGER,
+            frequency           REAL,
+            clicks              INTEGER,
+            ctr                 REAL,
+            cpm                 REAL,
+            cpc                 REAL,
+            conversions         INTEGER,
+            conversion_value    REAL,
+            roas                REAL,
+            video_plays         INTEGER,
+            video_p25           INTEGER,
+            video_p50           INTEGER,
+            video_p75           INTEGER,
+            video_p100          INTEGER,
+            raw_json            TEXT,
+            UNIQUE(ad_id, date_start, date_stop)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS collection_runs (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at   TEXT NOT NULL,
+            finished_at  TEXT,
+            days         INTEGER,
+            ads_fetched  INTEGER,
+            status       TEXT,
+            error        TEXT
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Meta API helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _get(url: str, params: dict, retries: int = 3) -> dict:
+    """GET with automatic retry on rate-limit (error code 17 / 80000)."""
+    params["access_token"] = META_TOKEN
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.get(url, params=params, timeout=30)
+            data = r.json()
+
+            # Rate limit hit — back off then retry
+            if "error" in data:
+                code = data["error"].get("code", 0)
+                if code in (17, 80000, 4) and attempt < retries:
+                    wait = 60 * attempt
+                    log.warning("Rate limited (code %s) — waiting %ds...", code, wait)
+                    time.sleep(wait)
+                    continue
+                raise RuntimeError(f"Meta API error: {data['error']}")
+
+            return data
+        except requests.RequestException as e:
+            if attempt == retries:
+                raise
+            log.warning("Request failed (attempt %d): %s", attempt, e)
+            time.sleep(5 * attempt)
+    return {}
+
+
+def _paginate(url: str, params: dict) -> list[dict]:
+    """Follow Meta's cursor-based pagination, return all results."""
+    results = []
+    while url:
+        data = _get(url, params)
+        results.extend(data.get("data", []))
+        url = data.get("paging", {}).get("next")
+        params = {}   # next URL already includes all params
+        if url:
+            time.sleep(0.3)  # gentle rate-limit buffer
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Metric extraction helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _extract_action(actions: list[dict], action_type: str) -> int:
+    """Sum values for a specific action type from the actions array."""
+    return sum(
+        int(a.get("value", 0))
+        for a in (actions or [])
+        if a.get("action_type") == action_type
+    )
+
+
+def _extract_action_value(action_values: list[dict], action_type: str) -> float:
+    """Sum monetary values for a specific action type."""
+    return sum(
+        float(a.get("value", 0.0))
+        for a in (action_values or [])
+        if a.get("action_type") == action_type
+    )
+
+
+def _video_views(insight: dict, percent: str) -> int:
+    key = f"video_p{percent}_watched_actions"
+    return _extract_action(insight.get(key, []), "video_view")
+
+
+def _parse_insight(insight: dict) -> dict:
+    """
+    Flatten a raw Meta insight dict into clean typed fields.
+    Computes ROAS = conversion_value / spend.
+    """
+    spend           = float(insight.get("spend", 0) or 0)
+    impressions     = int(insight.get("impressions", 0) or 0)
+    reach           = int(insight.get("reach", 0) or 0)
+    clicks          = int(insight.get("clicks", 0) or 0)
+    actions         = insight.get("actions", [])
+    action_values   = insight.get("action_values", [])
+
+    # Conversions — covers purchases, leads, app installs
+    conversions = (
+        _extract_action(actions, "purchase")
+        or _extract_action(actions, "lead")
+        or _extract_action(actions, "app_install")
+        or _extract_action(actions, "offsite_conversion.fb_pixel_purchase")
+        or _extract_action(actions, "omni_purchase")
+    )
+
+    # Conversion value (revenue) — same priority order
+    conv_value = (
+        _extract_action_value(action_values, "purchase")
+        or _extract_action_value(action_values, "omni_purchase")
+        or _extract_action_value(action_values, "offsite_conversion.fb_pixel_purchase")
+    )
+
+    roas = round(conv_value / spend, 4) if spend > 0 else 0.0
+    freq = round(impressions / reach, 2) if reach > 0 else 0.0
+
+    return {
+        "ad_id":            insight.get("ad_id", ""),
+        "ad_name":          insight.get("ad_name", ""),
+        "adset_id":         insight.get("adset_id", ""),
+        "adset_name":       insight.get("adset_name", ""),
+        "campaign_id":      insight.get("campaign_id", ""),
+        "campaign_name":    insight.get("campaign_name", ""),
+        "date_start":       insight.get("date_start", ""),
+        "date_stop":        insight.get("date_stop", ""),
+        "spend":            round(spend, 2),
+        "impressions":      impressions,
+        "reach":            reach,
+        "frequency":        freq,
+        "clicks":           clicks,
+        "ctr":              round(float(insight.get("ctr", 0) or 0), 4),
+        "cpm":              round(float(insight.get("cpm", 0) or 0), 4),
+        "cpc":              round(float(insight.get("cpc", 0) or 0), 4),
+        "conversions":      conversions,
+        "conversion_value": round(conv_value, 2),
+        "roas":             roas,
+        "video_plays":      _extract_action(insight.get("video_play_actions", []), "video_view"),
+        "video_p25":        _video_views(insight, "25"),
+        "video_p50":        _video_views(insight, "50"),
+        "video_p75":        _video_views(insight, "75"),
+        "video_p100":       _video_views(insight, "100"),
+        "raw_json":         json.dumps(insight),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Main collector class
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MetaCollector:
+    """
+    Pulls ad-level insights from Meta and persists them to SQLite.
+
+    Parameters
+    ----------
+    db_path : path to the SQLite database file (auto-created)
+    """
+
+    def __init__(self, db_path: str = DB_PATH):
+        self.db_path = db_path
+        self.conn    = init_db(db_path)
+        log.info("Collector initialised — db: %s", db_path)
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def collect_all(
+        self,
+        days: int = 7,
+        level: str = "ad",
+        date_preset: Optional[str] = None,
+    ) -> list[dict]:
+        """
+        Fetch insights for every ad in the account over `days` days.
+
+        Parameters
+        ----------
+        days        : lookback window (default 7). Ignored if date_preset set.
+        level       : 'ad' (default), 'adset', or 'campaign'
+        date_preset : Meta preset string e.g. 'last_7d', 'last_30d', 'this_month'
+
+        Returns
+        -------
+        list of parsed metric dicts (also saved to DB)
+        """
+        run_id = self._start_run(days)
+        start  = datetime.now()
+        log.info("Starting collection — last %d days, level=%s", days, level)
+
+        try:
+            raw = self._fetch_insights(days=days, level=level, date_preset=date_preset)
+            parsed = [_parse_insight(r) for r in raw]
+            saved  = self._save(parsed)
+            self._finish_run(run_id, saved)
+            elapsed = round((datetime.now() - start).total_seconds(), 1)
+            log.info("Collection complete — %d ads saved in %ss", saved, elapsed)
+            return parsed
+
+        except Exception as e:
+            self._finish_run(run_id, 0, error=str(e))
+            log.error("Collection failed: %s", e)
+            raise
+
+    def collect_date_range(self, since: str, until: str) -> list[dict]:
+        """
+        Fetch insights for a specific date range.
+
+        Parameters
+        ----------
+        since : 'YYYY-MM-DD'
+        until : 'YYYY-MM-DD'
+        """
+        run_id = self._start_run(days=None)
+        log.info("Collecting %s → %s", since, until)
+        try:
+            raw    = self._fetch_insights(since=since, until=until)
+            parsed = [_parse_insight(r) for r in raw]
+            saved  = self._save(parsed)
+            self._finish_run(run_id, saved)
+            return parsed
+        except Exception as e:
+            self._finish_run(run_id, 0, error=str(e))
+            raise
+
+    def latest(self, limit: int = 100) -> list[dict]:
+        """Return the most recently collected rows from the DB."""
+        cur = self.conn.execute(
+            "SELECT * FROM ad_metrics ORDER BY collected_at DESC LIMIT ?", (limit,)
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def get_ad(self, ad_id: str, days: int = 7) -> list[dict]:
+        """Return metric history for a single ad."""
+        since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        cur = self.conn.execute(
+            "SELECT * FROM ad_metrics WHERE ad_id=? AND date_start>=? ORDER BY date_start",
+            (ad_id, since),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def summary(self, days: int = 7) -> dict:
+        """
+        Aggregate totals across all ads for the last N days.
+        Returns spend, impressions, clicks, conversions, ROAS.
+        """
+        since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        cur = self.conn.execute("""
+            SELECT
+                COUNT(DISTINCT ad_id)       AS ads,
+                ROUND(SUM(spend), 2)        AS total_spend,
+                SUM(impressions)            AS total_impressions,
+                SUM(clicks)                 AS total_clicks,
+                SUM(conversions)            AS total_conversions,
+                ROUND(SUM(conversion_value), 2) AS total_revenue,
+                ROUND(AVG(ctr), 4)          AS avg_ctr,
+                ROUND(AVG(cpm), 2)          AS avg_cpm,
+                ROUND(SUM(conversion_value) / NULLIF(SUM(spend), 0), 2) AS overall_roas
+            FROM ad_metrics
+            WHERE date_start >= ?
+        """, (since,))
+        row = cur.fetchone()
+        return dict(row) if row else {}
+
+    def winners(self, min_spend: float = 10.0, min_roas: float = 2.0, days: int = 7) -> list[dict]:
+        """Ads with ROAS above threshold and minimum spend."""
+        since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        cur = self.conn.execute("""
+            SELECT ad_id, ad_name, campaign_name, adset_name,
+                   spend, roas, ctr, cpm, conversions, conversion_value
+            FROM ad_metrics
+            WHERE date_start >= ?
+              AND spend >= ?
+              AND roas >= ?
+            ORDER BY roas DESC
+        """, (since, min_spend, min_roas))
+        return [dict(r) for r in cur.fetchall()]
+
+    def losers(self, min_spend: float = 10.0, max_roas: float = 0.5, days: int = 7) -> list[dict]:
+        """Ads with poor ROAS after meaningful spend."""
+        since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        cur = self.conn.execute("""
+            SELECT ad_id, ad_name, campaign_name, adset_name,
+                   spend, roas, ctr, cpm, conversions
+            FROM ad_metrics
+            WHERE date_start >= ?
+              AND spend >= ?
+              AND roas <= ?
+            ORDER BY spend DESC
+        """, (since, min_spend, max_roas))
+        return [dict(r) for r in cur.fetchall()]
+
+    def needs_more_data(self, min_impressions: int = 500, days: int = 7) -> list[dict]:
+        """Ads not yet statistically meaningful — below impression threshold."""
+        since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        cur = self.conn.execute("""
+            SELECT ad_id, ad_name, spend, impressions, ctr
+            FROM ad_metrics
+            WHERE date_start >= ?
+              AND impressions < ?
+            ORDER BY impressions DESC
+        """, (since, min_impressions))
+        return [dict(r) for r in cur.fetchall()]
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _fetch_insights(
+        self,
+        days: int = 7,
+        level: str = "ad",
+        date_preset: Optional[str] = None,
+        since: Optional[str] = None,
+        until: Optional[str] = None,
+    ) -> list[dict]:
+        """Call the Meta Insights edge and paginate through all results."""
+        url    = f"{BASE}/{AD_ACCOUNT}/insights"
+        params = {
+            "level":  level,
+            "fields": ",".join(INSIGHT_FIELDS),
+            "limit":  500,
+        }
+
+        if since and until:
+            params["time_range"] = json.dumps({"since": since, "until": until})
+        elif date_preset:
+            params["date_preset"] = date_preset
+        else:
+            since_dt = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+            until_dt = datetime.now().strftime("%Y-%m-%d")
+            params["time_range"] = json.dumps({"since": since_dt, "until": until_dt})
+
+        log.info("Fetching insights from Meta (level=%s)...", level)
+        results = _paginate(url, params)
+        log.info("  → %d raw rows returned", len(results))
+        return results
+
+    def _save(self, rows: list[dict]) -> int:
+        """Upsert parsed metrics into DB. Returns count of rows saved."""
+        saved = 0
+        for row in rows:
+            try:
+                self.conn.execute("""
+                    INSERT OR REPLACE INTO ad_metrics (
+                        collected_at, date_start, date_stop,
+                        ad_id, ad_name, adset_id, adset_name,
+                        campaign_id, campaign_name,
+                        spend, impressions, reach, frequency,
+                        clicks, ctr, cpm, cpc,
+                        conversions, conversion_value, roas,
+                        video_plays, video_p25, video_p50, video_p75, video_p100,
+                        raw_json
+                    ) VALUES (
+                        :collected_at, :date_start, :date_stop,
+                        :ad_id, :ad_name, :adset_id, :adset_name,
+                        :campaign_id, :campaign_name,
+                        :spend, :impressions, :reach, :frequency,
+                        :clicks, :ctr, :cpm, :cpc,
+                        :conversions, :conversion_value, :roas,
+                        :video_plays, :video_p25, :video_p50, :video_p75, :video_p100,
+                        :raw_json
+                    )
+                """, {**row, "collected_at": datetime.now().isoformat()})
+                saved += 1
+            except Exception as e:
+                log.warning("Failed to save ad %s: %s", row.get("ad_id"), e)
+        self.conn.commit()
+        return saved
+
+    def _start_run(self, days) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO collection_runs (started_at, days, status) VALUES (?, ?, 'running')",
+            (datetime.now().isoformat(), days),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def _finish_run(self, run_id: int, ads_fetched: int, error: str = None):
+        self.conn.execute(
+            "UPDATE collection_runs SET finished_at=?, ads_fetched=?, status=?, error=? WHERE id=?",
+            (datetime.now().isoformat(), ads_fetched, "error" if error else "ok", error, run_id),
+        )
+        self.conn.commit()
