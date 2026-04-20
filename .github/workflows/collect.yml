@@ -1,0 +1,37 @@
+name: Daily ad collection
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run collector
+        run: python run_collector.py
+        env:
+          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+          META_AD_ACCOUNT_ID: ${{ secrets.META_AD_ACCOUNT_ID }}
+          META_CAMPAIGN_ID: ${{ secrets.META_CAMPAIGN_ID }}
+          META_ADSET_ID: ${{ secrets.META_ADSET_ID }}
+          META_PAGE_ID: ${{ secrets.META_PAGE_ID }}
+
+      - name: Save data as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ad-metrics
+          path: data_collector/metrics.db
+          retention-days: 7
