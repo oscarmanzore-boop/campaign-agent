@@ -1,4 +1,4 @@
-name: Daily ad collection
+name: Daily ad analysis
 
 on:
   schedule:
@@ -6,10 +6,11 @@ on:
   workflow_dispatch:
 
 jobs:
-  collect:
+  collect-and-analyze:
     runs-on: ubuntu-latest
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
     steps:
       - uses: actions/checkout@v4
 
@@ -21,7 +22,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run collector
-        run: python run_collector.py
+        run: python run_collector.py --no-creative
         env:
           META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
           META_AD_ACCOUNT_ID: ${{ secrets.META_AD_ACCOUNT_ID }}
@@ -29,9 +30,18 @@ jobs:
           META_ADSET_ID: ${{ secrets.META_ADSET_ID }}
           META_PAGE_ID: ${{ secrets.META_PAGE_ID }}
 
-      - name: Save data as artifact
+      - name: Run AI analyzer
+        run: python analyzer/analyzer.py --days 7
+        env:
+          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+          META_AD_ACCOUNT_ID: ${{ secrets.META_AD_ACCOUNT_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Save artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ad-metrics
-          path: data_collector/metrics.db
+          name: campaign-report
+          path: |
+            data_collector/metrics.db
+            analyzer/report.json
           retention-days: 7
